@@ -615,15 +615,114 @@ class SessionDetailResponse(BaseModel):
     num_periods: int
     confirmed_periods: int
     next_index: int
+    current_revision: int = Field(
+        description="当前计量表修订号：未更正为 0，每次成功更正 +1；"
+        "此处的 confirmed_records 永远是最初上报记录，不受修订影响"
+    )
     status: Literal["awaiting_records", "in_progress", "complete"]
     dispatch: DispatchRequest = Field(description="原 /dispatch 输入，可直接用于续排/结算")
     plan_snapshot: DispatchResponse = Field(description="已核对一致的原计划快照")
     confirmed_records: List[ConfirmedRecord] = Field(
         description="自下标 0 起连续已确认的实测记录（未完成前缀可用于 /dispatch/replan；"
-        "满期记录可用于 /dispatch/settlement）"
+        "满期记录可用于 /dispatch/settlement）；始终为最初上报记录，更正不改写它们"
     )
     confirmed_audit: List[BatchAuditRecord] = Field(
         description="对全部连续已确认记录重算的遥测审计（全局下标）"
     )
     initial_soc_kwh: float
     final_soc_kwh: Optional[float]
+
+
+# ---------------------------------------------------------------------------
+# 计量表更正（修订台账）：保留最初上报证据，叠加提供修订后的实测台账
+# ---------------------------------------------------------------------------
+
+
+class RevisionChange(BaseModel):
+    """一条时段级完整替换：指定下标的整条实测记录被替换（不是字段级 patch）。"""
+
+    index: int = Field(ge=0, description="被替换时段在原时间轴上的下标（从 0 起）")
+    record: TelemetryRecord = Field(
+        description="该下标的完整替换记录（七个测量字段须全部给出，缺字段即按缺省值替换）"
+    )
+
+
+class RevisionCreateRequest(BaseModel):
+    """计量表更正提交：期望修订号 + 至少一个「下标 + 完整替换记录」。"""
+
+    expected_revision: int = Field(
+        ge=0,
+        description="客户端基于的当前修订号（乐观并发）：完成会话从 0 开始，"
+        "与服务端当前号不符返回 409 冲突及当前号",
+    )
+    changes: Annotated[
+        List[RevisionChange], Field(min_length=1, max_length=MAX_PERIODS)
+    ] = Field(description="本次替换的时段记录（下标重复或越界整次拒绝）")
+
+
+class RevisionChangeRecord(BaseModel):
+    """修订台账中的一条：全局下标 + 该下标当前生效的完整实测记录。"""
+
+    index: int = Field(description="原计划时间轴上的时段下标（从 0 起）")
+    record: TelemetryRecord = Field(description="该下标当前生效的实测记录（可能来自某次更正替换）")
+
+
+class OriginalRecord(BaseModel):
+    """最初上报证据：下标 + 原始记录 + 入库时间，更正永不改写。"""
+
+    index: int
+    record: TelemetryRecord
+    stored_at: str = Field(description="该记录最初入库时间（UTC ISO 8601）")
+
+
+class RevisionHistoryItem(BaseModel):
+    """一次成功更正的历史条目：新修订号、原始提交的变更与确认时间。"""
+
+    revision_no: int = Field(description="该次更正落盘后的修订号（从 1 起）")
+    changes: List[RevisionChange] = Field(description="该次提交的原始「下标 + 完整替换记录」")
+    changed_indices: List[int] = Field(description="该次提交涉及的下标，按提交顺序去重升序")
+    created_at: str = Field(description="该次更正确认时间（UTC ISO 8601）")
+
+
+class SettlementRequestBody(BaseModel):
+    """可直接 POST 给 /dispatch/settlement 的完整请求体（记录取当前修订台账）。"""
+
+    dispatch: DispatchRequest
+    plan_snapshot: DispatchResponse
+    settlement_tolerance_kwh: float = Field(
+        description="取会话创建时提交的审计容差 audit_tolerance_kwh"
+    )
+    records: List[TelemetryRecord] = Field(
+        description="当前修订后的整段实测台账（未被替换的时段保持最初上报值）"
+    )
+
+
+class RevisionDetailResponse(BaseModel):
+    """计量表更正/查询响应：原始证据、当前修订台账、差异下标与可提交的结算请求。"""
+
+    session_id: str
+    num_periods: int
+    confirmed_periods: int
+    status: Literal["complete"] = Field(description="仅满期（complete）会话允许更正")
+    current_revision: int = Field(description="当前修订号：首次更正成功后为 1，之后叠加递增")
+    audit_tolerance_kwh: float
+    original_records: List[OriginalRecord] = Field(
+        description="最初上报的实测台账（证据原样保留，任何更正都不改写）"
+    )
+    revised_records: List[RevisionChangeRecord] = Field(
+        description="当前修订后的整段实测台账（未指定时段保持原值）"
+    )
+    changed_indices: List[int] = Field(
+        description="当前修订台账相对最初上报有差异的下标（升序）"
+    )
+    revisions: List[RevisionHistoryItem] = Field(
+        description="历次更正历史（修订号、原始变更、确认时间），未更正时为空"
+    )
+    revised_audit: List[BatchAuditRecord] = Field(
+        description="用会话容量、效率、初始 SOC 与审计容差对整段修订台账重算的遥测审计"
+    )
+    initial_soc_kwh: float
+    final_soc_kwh: float = Field(description="当前修订台账最后一条记录的末态 SOC")
+    settlement_request: SettlementRequestBody = Field(
+        description="可直接整体 POST 给 /dispatch/settlement 的完整请求数据"
+    )

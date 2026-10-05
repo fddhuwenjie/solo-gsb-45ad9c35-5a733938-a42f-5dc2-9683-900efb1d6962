@@ -15,6 +15,8 @@ from app.models import (
     ErrorResponse,
     ReplanRequest,
     ReplanResponse,
+    RevisionCreateRequest,
+    RevisionDetailResponse,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionDetailResponse,
@@ -25,6 +27,7 @@ from app.models import (
     TelemetryAuditResponse,
 )
 from app.replan import ReplanError, execute_replan
+from app.revisions import RevisionError, get_revision, submit_revision
 from app.sessions import SessionError, append_batch, create_session, get_session, list_sessions
 from app.settlement import SettlementError, execute_settlement
 from app.solver import InfeasibleError, solve_dispatch
@@ -44,9 +47,13 @@ app = FastAPI(
         "完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加半小时"
         "实测记录（沿用遥测审计、整批通过才入库、与已确认整批完全一致的重试幂等返回"
         "首收回执、其余重叠上报返回冲突），"
-        "记录持久化在 SQLite 中，进程重启后仍可查询、续报、续排与结算。"
+        "记录持久化在 SQLite 中，进程重启后仍可查询、续报、续排与结算；"
+        "满期会话可经 /dispatch/sessions/{id}/revisions 提交计量表更正："
+        "按期望修订号叠加「下标 + 完整替换记录」，整段台账重核通过后原子落盘，"
+        "最初上报证据与批次首收回执永不改写，查询返回原始/修订台账、差异下标"
+        "与可直接提交结算接口的完整请求数据。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -94,6 +101,17 @@ async def session_error_handler(request: Request, exc: SessionError):
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.code, "reason": str(exc)},
+    )
+
+
+@app.exception_handler(RevisionError)
+async def revision_error_handler(request: Request, exc: RevisionError):
+    body = {"error": exc.code, "reason": str(exc)}
+    # 附加字段（如修订号冲突时的 current_revision）随错误体顶层返回
+    body.update(exc.extra)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=body,
     )
 
 
@@ -260,6 +278,53 @@ async def append_session_batch(
 async def list_dispatch_sessions() -> SessionListResponse:
     """列出全部执行会话概览（创建时间升序）。"""
     return SessionListResponse.model_validate(list_sessions())
+
+
+@app.post(
+    "/dispatch/sessions/{session_id}/revisions",
+    response_model=RevisionDetailResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "会话不存在"},
+        409: {"model": ErrorResponse, "description": "期望修订号过期（附当前修订号）"},
+        422: {"model": ErrorResponse, "description": "未满期、下标重复/越界、首态断点或整段重核失败"},
+    },
+    tags=["sessions"],
+)
+async def submit_session_revision(
+    session_id: str, req: RevisionCreateRequest
+) -> RevisionDetailResponse:
+    """满期会话的计量表更正（乐观修订号）。
+
+    - 提交期望修订号（完成会话从 0 开始）与至少一个「时段下标 + 完整替换记录」，
+      本次变更在当前版本台账上叠加（未指定时段保持原值），随后用会话的容量、
+      效率、初始 SOC 与审计容差重新核对整段台账：
+    - 下标重复 / 越界、任一时段能量失衡或相邻 SOC 断点均整次拒绝，已有修订不变，
+      错误原因点名下标；期望修订号过期返回 409 及当前号；
+    - 核对通过后原子保存新修订号、原始变更与整段修订台账；
+      最初上报记录、批次边界与首收回执永不改写。
+    """
+    result = submit_revision(
+        session_id=session_id,
+        expected_revision=req.expected_revision,
+        raw_changes=[
+            {"index": ch.index, "record": ch.record.model_dump()} for ch in req.changes
+        ],
+    )
+    return RevisionDetailResponse.model_validate(result)
+
+
+@app.get(
+    "/dispatch/sessions/{session_id}/revisions",
+    response_model=RevisionDetailResponse,
+    responses={404: {"model": ErrorResponse, "description": "会话不存在"}},
+    tags=["sessions"],
+)
+async def get_session_revision(session_id: str) -> RevisionDetailResponse:
+    """查询计量表修订：最初上报记录（原始证据）、当前修订记录、差异下标、
+    历次更正历史，以及可直接整体 POST 给 /dispatch/settlement 的完整请求数据。
+    无更正时当前修订号为 0、修订台账即最初上报记录。"""
+    result = get_revision(session_id)
+    return RevisionDetailResponse.model_validate(result)
 
 
 @app.get(

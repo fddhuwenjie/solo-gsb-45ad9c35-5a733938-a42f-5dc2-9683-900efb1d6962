@@ -342,6 +342,10 @@ def get_session(session_id: str, store: Optional[SessionStore] = None) -> dict:
     updated_at = rows[-1]["stored_at"] if rows else None
     final_soc = records[-1].soc_end_kwh if records else None
 
+    # 当前计量表修订号（仅用于查询展示）；更正记录在独立的 session_revisions 表，
+    # 不影响 session_records / session_batches 与批次重试、首收回执。
+    current_revision = store.get_current_revision_no(session_id)
+
     return {
         "session_id": session_id,
         "created_at": session["created_at"],
@@ -350,6 +354,7 @@ def get_session(session_id: str, store: Optional[SessionStore] = None) -> dict:
         "num_periods": num_periods,
         "confirmed_periods": confirmed,
         "next_index": confirmed,
+        "current_revision": current_revision,
         "status": _status(confirmed, num_periods),
         "dispatch": dispatch,
         "plan_snapshot": session["plan_snapshot"],
