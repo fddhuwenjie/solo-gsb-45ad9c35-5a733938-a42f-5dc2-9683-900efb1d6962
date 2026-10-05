@@ -7,9 +7,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.audit import audit_telemetry
+from app.corrections import get_corrections, submit_correction
 from app.models import (
     BatchAppendRequest,
     BatchAppendResponse,
+    CorrectionDetailResponse,
+    CorrectionRequest,
+    CorrectionResponse,
     DispatchRequest,
     DispatchResponse,
     ErrorResponse,
@@ -44,9 +48,13 @@ app = FastAPI(
         "完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加半小时"
         "实测记录（沿用遥测审计、整批通过才入库、与已确认整批完全一致的重试幂等返回"
         "首收回执、其余重叠上报返回冲突），"
-        "记录持久化在 SQLite 中，进程重启后仍可查询、续报、续排与结算。"
+        "记录持久化在 SQLite 中，进程重启后仍可查询、续报、续排与结算；"
+        "已完成会话还可用 /dispatch/sessions/{id}/corrections 提交计量表更正："
+        "按期望修订号叠加「时段下标 + 完整替换记录」，整段重核通过后原子落库，"
+        "原始上报证据保留不改写，查询返回原始与当前修订记录、差异下标及可直接"
+        "交给 /dispatch/settlement 的完整请求数据。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -274,3 +282,53 @@ async def get_dispatch_session(session_id: str) -> SessionDetailResponse:
     满期（status=complete）记录可用于 /dispatch/settlement。"""
     result = get_session(session_id)
     return SessionDetailResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/sessions/{session_id}/corrections",
+    response_model=CorrectionResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "会话不存在"},
+        409: {"model": ErrorResponse, "description": "期望修订号过期（原因中给出当前修订号）"},
+        422: {"model": ErrorResponse, "description": "会话未完成、下标重复/越界、首态不接或修订台账未通过审计"},
+    },
+    tags=["corrections"],
+)
+async def submit_session_correction(
+    session_id: str, req: CorrectionRequest
+) -> CorrectionResponse:
+    """已完成会话的计量表更正。
+
+    - 提交期望修订号（须等于会话当前修订号，完成会话从 0 开始）与至少一个
+      「时段下标 + 完整替换记录」；更正在当前版本上叠加，未指定时段保持当前值；
+    - 用会话的容量、效率、初始 SOC 与审计容差重新核对整段修订记录：下标重复/
+      越界、任一时段能量失衡或相邻 SOC 断点均整次拒绝（422，原因点名出错下标），
+      已有修订不变；期望修订号过期返回 409 与当前号；
+    - 核对通过后新修订号与全量修订记录原子落库；最初上报的原始记录、批次重试
+      判定与首次回执一律不改写。
+    """
+    result = submit_correction(
+        session_id=session_id,
+        expected_revision=req.expected_revision,
+        entries=[
+            {"index": e.index, "record": e.record.model_dump()} for e in req.entries
+        ],
+    )
+    return CorrectionResponse.model_validate(result)
+
+
+@app.get(
+    "/dispatch/sessions/{session_id}/corrections",
+    response_model=CorrectionDetailResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "会话不存在"},
+        422: {"model": ErrorResponse, "description": "会话尚未完成"},
+    },
+    tags=["corrections"],
+)
+async def get_session_corrections(session_id: str) -> CorrectionDetailResponse:
+    """查询计量表更正台账：最初上报的原始记录、当前修订记录、两者差异下标、
+    已生效修订历史，以及可直接 POST 给 /dispatch/settlement 的完整请求数据
+    （records 取当前修订记录）。"""
+    result = get_corrections(session_id)
+    return CorrectionDetailResponse.model_validate(result)

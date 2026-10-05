@@ -1,6 +1,6 @@
 # 家庭储能时段调度 API
 
-基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；批次边界与首次回执随记录同事务落库，**起点、长度、内容都与某已确认整批一致**的重试幂等返回该批首收回执（不随后续批次漂移），短批、内容变更或跨批拼接等重叠上报一律 409、只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。
+基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。`/dispatch/sessions` 进一步提供**可持久接续的执行会话**：实测记录可分多批到达，创建会话时提交原 `/dispatch` 输入、完整计划快照与审计容差（先重算确认快照一致），之后按时段下标成批追加记录，首批首态接原初始 SOC、后续批次首态接已保存末态，沿用现有遥测审计逐段核对且**整批原子入库**；批次边界与首次回执随记录同事务落库，**起点、长度、内容都与某已确认整批一致**的重试幂等返回该批首收回执（不随后续批次漂移），短批、内容变更或跨批拼接等重叠上报一律 409、只有一份生效；会话与记录落在 **SQLite（命名卷）**，进程重启后仍可查询、续报，未完成前缀可直接续排、满期记录可直接结算。已完成会话还支持**计量表更正**：`/dispatch/sessions/{id}/corrections` 按期望修订号提交「时段下标 + 完整替换记录」，更正在当前版本上叠加（未指定时段保持当前值），用会话的容量、效率、初始 SOC 与审计容差**重新核对整段修订记录**后原子落库；最初上报的原始记录、批次重试判定与首次回执一律不改写，查询返回原始与当前修订记录、差异下标，以及可直接提交 `/dispatch/settlement` 的完整请求数据。
 
 ## 一条命令启动
 
@@ -571,11 +571,34 @@ curl -s -X POST http://localhost:8000/dispatch/replan \
 
 单会话查询返回：原计划信息（`dispatch` + `plan_snapshot` + `audit_tolerance_kwh`）、自下标 0 起**连续已确认记录** `confirmed_records`（每条带全局 `index`、原始 `record` 与 `stored_at`）、对全部确认记录重算的 `confirmed_audit`、`next_index`、`status`、`initial_soc_kwh` 与 `final_soc_kwh`。未完成的前缀可直接取 `confirmed_records[*].record` 作为 `executed_records` 交给 `/dispatch/replan`；`status=complete` 的满期记录可直接作为 `records` 交给 `/dispatch/settlement`。列表接口返回全部会话的概览（确认段数、下一下标、状态、首末 SOC、时间戳）。未知会话返回 **404 `session_not_found`**。
 
+### `POST /dispatch/sessions/{session_id}/corrections` — 计量表更正
+
+已完成（`status=complete`）会话收到计量表更正时，在**保留最初上报证据**的前提下叠加修订台账。请求体：
+
+| 字段 | 说明 |
+|---|---|
+| `expected_revision` | 期望修订号：须等于会话**当前修订号**（完成会话从 **0** 开始，每次成功更正 +1）；不一致即过期，返回 **409 `conflict`** 并在原因中给出当前号 |
+| `entries` | 至少一个 `{index, record}` 条目：`index` 为要替换的时段下标，`record` 为该时段的**完整替换记录**（字段同 `/telemetry/audit`） |
+
+服务端处理规则：
+
+1. **仅已完成会话**可更正，未完成返回 `session_not_complete`（查询接口同）；
+2. **叠加语义**：更正在当前版本上叠加，未指定时段保持当前版本的值（第 0 版即最初上报的原始记录）；
+3. **整段重核**：用会话的容量、效率、初始 SOC 与审计容差重新核对修订后的**整段**记录——首条首态须在容差内接原初始 SOC，逐条电芯能量守恒、购电量平衡、相邻记录 SOC 衔接；下标重复（`correction_index_duplicate`）或越界（`correction_out_of_range`）、任一时段能量失衡或相邻 SOC 断点（`correction_audit_failed`）、首态不接（`correction_boundary_gap`）均**整次拒绝**（422），原因中点名出错下标，已有修订不变；
+4. **原子落库**：核对通过后，新修订号（当前号 + 1）与全量修订记录在同一 SQLite 写事务内保存；并发更正由写事务串行判定，同期望号只有一份生效；
+5. **原始证据不改写**：原会话查询、批次重试判定与首次回执继续使用最初上报的记录（`session_records` / `session_batches` 不动），修订存于独立的 `session_corrections` 表，进程重启后仍可查询并继续更正。
+
+响应：`revision`（生效后的当前修订号）、`corrected_indices`（本次替换的下标）、`changed_indices`（当前修订与原始记录不一致的下标）、`first_record_soc_gap_kwh`、整段重核的 `revised_audit` 与 `stored_at`。
+
+### `GET /dispatch/sessions/{session_id}/corrections` — 查询更正台账
+
+返回：`current_revision`（当前修订号，0 表示尚无更正）、`original_records`（最初上报的原始记录，含入库时间）、`revised_records`（当前修订后的完整台账）、`changed_indices`（两者差异下标）、对当前修订整段重算的 `revised_audit`、已生效修订历史 `revisions`，以及 `settlement_request`——可直接 POST 给 `/dispatch/settlement` 的完整请求数据（原 `dispatch` 输入、原计划快照、会话审计容差与**当前修订记录**）。会话不存在返回 404，未完成返回 422 `session_not_complete`。
+
 ### 持久化
 
-会话、逐段记录、批次边界与首次回执存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话与已确认记录**原样保留**，可继续查询、幂等重试与续报。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重。
+会话、逐段记录、批次边界与首次回执、计量表更正修订存放在容器内 `/data/sessions.db`（SQLite，环境变量 `DISPATCH_SESSION_DB` 可覆盖路径），Compose 已把命名卷 `dispatch-session-data` 挂到 `/data`：容器重建、镜像升级或进程重启后，会话、已确认记录与已生效修订**原样保留**，可继续查询、幂等重试、续报与更正。裸机运行时若 `/data` 不可写，自动落到工作目录 `./data/sessions.db`。旧版本库（只有逐段记录、无批次边界表）打开时自动补建新表：查询与从 `next_index` 续报不受影响，历史区间因无法确认批次边界，重叠上报按 409 处理而不猜测去重；更正表（`session_corrections`）同样自动补建，空表即当前第 0 版（最初上报记录）。
 
-### 可执行示例（创建、分批追加、重试、查询、续排/结算）
+### 可执行示例（创建、分批追加、重试、查询、续排/结算、计量表更正）
 
 以下示例在仓库目录直接可跑（需要 `jq`；先 `docker compose up -d --build`）。所用 4 段计划为「t0 谷时充 0.2kWh、t1/t2 各放 0.1kWh、t3 静置」，效率 0.9、容差 0.01kWh。
 
@@ -686,9 +709,41 @@ jq -c '{dispatch, plan_snapshot, audit_tolerance_kwh,
             remaining_pv_kw: [0.0, 0.0]}' /tmp/detail.json \
   | curl -s -X POST $BASE/dispatch/replan -H 'Content-Type: application/json' -d @- \
   | jq '{executed_periods, remaining_periods, total_cost_yuan}'
+
+# 8) 计量表更正：t1 购电表读数应为 0.015（原报 0.01），按期望修订号 0 提交
+#    （完成会话从修订号 0 开始；entries 为「时段下标 + 完整替换记录」，可多条）
+curl -s -X POST $BASE/dispatch/sessions/$SID/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 0,
+    "entries": [
+      {"index": 1,
+       "record": {"base_load_kw": 0.2, "pv_kw": 0.0,
+                  "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.09,
+                  "grid_purchase_energy_kwh": 0.015,
+                  "soc_start_kwh": 0.2, "soc_end_kwh": 0.1}}
+    ]
+  }' | jq '{revision, corrected_indices, changed_indices}'
+
+#    修订号过期（如再次用 0 提交）→ HTTP 409 conflict，原因中给出当前修订号；
+#    下标重复/越界、能量失衡、相邻 SOC 断点 → 422 并点名出错下标，已有修订不变
+
+# 9) 查询更正台账：原始记录、当前修订记录、差异下标与结算入参
+curl -s $BASE/dispatch/sessions/$SID/corrections | tee /tmp/corr.json | jq \
+  '{current_revision, changed_indices,
+    original: .original_records[1].record.grid_purchase_energy_kwh,
+    revised: .revised_records[1].record.grid_purchase_energy_kwh}'
+
+# 10) 用返回的结算入参直接结算修订后台账（t1 按 0.015 计费）
+jq -c .settlement_request /tmp/corr.json \
+  | curl -s -X POST $BASE/dispatch/settlement -H 'Content-Type: application/json' -d @- \
+  | jq '{status, actual_energy_cost: .summary.actual_energy_cost_yuan}'
+
+#    原会话查询不受更正影响：confirmed_records 仍是最初上报的记录（t1 购电 0.01）
+curl -s $BASE/dispatch/sessions/$SID | jq '.confirmed_records[1].record.grid_purchase_energy_kwh'
 ```
 
-进程重启验证：`docker compose restart`（或 `docker compose down && docker compose up -d`，命名卷保留）后再次执行第 5 步，会话与已确认记录仍在；对已保存批次执行第 3、4b 步仍返回 `deduped`，且回执保持各批首次成功时的值。
+进程重启验证：`docker compose restart`（或 `docker compose down && docker compose up -d`，命名卷保留）后再次执行第 5 步，会话与已确认记录仍在；对已保存批次执行第 3、4b 步仍返回 `deduped`，且回执保持各批首次成功时的值；第 9 步的更正台账同样保留，并可按当前修订号继续提交第 8 步的更正。
 
 ## 模型与假设
 
@@ -767,6 +822,16 @@ jq -c '{dispatch, plan_snapshot, audit_tolerance_kwh,
 - `session_not_found`（404）：会话 ID 不存在；
 - `invalid_input`：容差为负 / 非有限、批为空或超长、测量值为负 / 非有限、SOC 超容量等。
 
+计量表更正接口的错误码（除 `conflict` 为 **HTTP 409**、`session_not_found` 为 **HTTP 404** 外，其余为 422；所有拒绝均整次生效、已有修订不变）：
+
+- `session_not_complete`：会话尚未完成（无完整原始台账），不能提交或查询更正；
+- `correction_index_duplicate`：同一时段下标在一次更正中出现多次，原因点名该下标；
+- `correction_out_of_range`：更正下标超出计划时段范围 `[0, num_periods)`，原因点名该下标；
+- `correction_boundary_gap`：修订后首条记录首态未在审计容差内接原初始 SOC；
+- `correction_audit_failed`：修订后整段台账中某时段能量失衡或相邻 SOC 断点，原因点名首个异常下标与残差；
+- `conflict`（409）：期望修订号过期（落后或超前），原因中给出当前修订号，请基于当前修订重新提交；
+- `invalid_input`：更正条目为空、测量值为负 / 非有限、SOC 超容量等。
+
 注意：已执行动作**偏离旧计划**本身不构成拒绝——只要实测记录自洽（含相邻记录 SOC 衔接），偏离只作为 `soc_gap_*` 与各费用差额信息返回，续排一律以实测末态为准。
 
 ## 测试
@@ -776,4 +841,4 @@ pip install pytest httpx
 pytest tests/ -q
 ```
 
-覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。续排部分覆盖：原时间轴已执行/待执行明细与费用口径、余段电价变化后的最优重排、实测偏离旧计划但自洽时保留原记录并从末态重排、容差内表计偏差照实计费、余段输入与快照的结算接口端到端衔接（含余段仅一段）、首态 SOC 容差边界（等于容差通过、超出拒绝），以及前缀审计异常、首态未接原初值、末态非 0.1kWh 网格、余段末端约束不可达（`infeasible`）、快照篡改、长度不符、空前缀/全周期前缀、非法容差/测量值/余段预测等各类整体拒绝。执行会话部分覆盖：创建时快照重算核对（含篡改、原输入无解）、分批追加的首批/后续批首态衔接（含容差边界）、动作偏离计划但自洽仍接受、下标跳跃与越界整批不入库且无副作用、批内核电芯能量/购电量/SOC 衔接异常整批拒绝、同起点原样重试返回 deduped、同起点内容不同（含部分重叠）返回 409、并发同起点上报只有一份生效（多线程）、查询返回原计划与连续已确认记录及下一下标、未完成前缀端到端续排、满期记录端到端结算、按同一路径重建存储模拟进程重启后记录仍在且可续报、空批/负值/SOC 超容量等非法输入拦截，以及既有四个接口行为不变。
+覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。续排部分覆盖：原时间轴已执行/待执行明细与费用口径、余段电价变化后的最优重排、实测偏离旧计划但自洽时保留原记录并从末态重排、容差内表计偏差照实计费、余段输入与快照的结算接口端到端衔接（含余段仅一段）、首态 SOC 容差边界（等于容差通过、超出拒绝），以及前缀审计异常、首态未接原初值、末态非 0.1kWh 网格、余段末端约束不可达（`infeasible`）、快照篡改、长度不符、空前缀/全周期前缀、非法容差/测量值/余段预测等各类整体拒绝。执行会话部分覆盖：创建时快照重算核对（含篡改、原输入无解）、分批追加的首批/后续批首态衔接（含容差边界）、动作偏离计划但自洽仍接受、下标跳跃与越界整批不入库且无副作用、批内核电芯能量/购电量/SOC 衔接异常整批拒绝、同起点原样重试返回 deduped、同起点内容不同（含部分重叠）返回 409、并发同起点上报只有一份生效（多线程）、查询返回原计划与连续已确认记录及下一下标、未完成前缀端到端续排、满期记录端到端结算、按同一路径重建存储模拟进程重启后记录仍在且可续报、空批/负值/SOC 超容量等非法输入拦截，以及既有四个接口行为不变。计量表更正部分覆盖：未完成会话拒绝更正与查询、单次/多条/叠加更正与未指定时段保持当前值、第 0 版查询（无更正时修订记录即原始记录）、期望修订号过期（落后/超前）返回 409 与当前号、下标重复/越界点名下标整次拒绝、电芯能量失衡/购电量失衡/相邻 SOC 断点/首态不接原初始 SOC 整次拒绝且已有修订不变、偏离计划但自洽的修订被接受、更正后原会话查询与批次重试回执保持原始记录、结算入参端到端结算修订台账、并发同期望号更正只有一份生效、进程重启后修订仍可查询并继续更正、旧库自动补建更正表，以及非法输入拦截。

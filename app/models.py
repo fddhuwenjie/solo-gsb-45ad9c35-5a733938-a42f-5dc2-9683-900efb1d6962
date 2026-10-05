@@ -627,3 +627,96 @@ class SessionDetailResponse(BaseModel):
     )
     initial_soc_kwh: float
     final_soc_kwh: Optional[float]
+
+
+# ---------------------------------------------------------------------------
+# 已完成会话的计量表更正
+# ---------------------------------------------------------------------------
+
+
+class CorrectionEntry(BaseModel):
+    """一个更正条目：时段下标 + 该时段的完整替换记录。"""
+
+    index: int = Field(ge=0, description="要替换的时段下标（原计划时间轴，从 0 起）")
+    record: TelemetryRecord = Field(description="该时段的完整替换记录（字段同 /telemetry/audit）")
+
+
+class CorrectionRequest(BaseModel):
+    """计量表更正请求：期望修订号 + 至少一个「时段下标、完整替换记录」。"""
+
+    expected_revision: int = Field(
+        ge=0,
+        description="期望修订号：须等于会话当前修订号（完成会话从 0 开始），"
+        "不一致即过期，返回 409 与当前号",
+    )
+    entries: Annotated[
+        List[CorrectionEntry], Field(min_length=1, max_length=MAX_PERIODS)
+    ] = Field(
+        description="至少一个更正条目；更正在当前版本上叠加，未指定时段保持当前版本的值"
+    )
+
+
+class CorrectionResponse(BaseModel):
+    """更正通过后的回执：新修订号与整段重核结果。"""
+
+    session_id: str
+    revision: int = Field(description="本次更正生效后的当前修订号（原当前号 + 1）")
+    num_periods: int
+    corrected_indices: List[int] = Field(description="本次更正替换的时段下标（升序）")
+    changed_indices: List[int] = Field(
+        description="当前修订与最初上报记录不一致的时段下标（升序）"
+    )
+    first_record_soc_gap_kwh: float = Field(
+        description="修订后首条记录首态 SOC 与原初始 SOC 之差"
+    )
+    revised_audit: List[BatchAuditRecord] = Field(
+        description="对修订后整段台账重算的遥测审计（全局下标，全部通过才会入库）"
+    )
+    stored_at: str = Field(description="本修订入库时间（UTC ISO 8601）")
+
+
+class RevisedRecord(BaseModel):
+    """当前修订台账中的一条记录：时段下标 + 修订后的实测记录。"""
+
+    index: int = Field(description="原计划时间轴上的时段下标（从 0 起）")
+    record: TelemetryRecord
+
+
+class CorrectionRevisionSummary(BaseModel):
+    """一次已生效更正的概览。"""
+
+    revision: int = Field(description="修订号（从 1 起单调递增；第 0 版为原始记录）")
+    corrected_indices: List[int] = Field(description="该次更正替换的时段下标（升序）")
+    stored_at: str = Field(description="该修订入库时间（UTC ISO 8601）")
+
+
+class CorrectionDetailResponse(BaseModel):
+    """更正台账查询：原始记录 + 当前修订记录 + 差异下标 + 结算接口入参。"""
+
+    session_id: str
+    created_at: str
+    updated_at: Optional[str] = Field(description="最近一次更正入库时间，无更正为 null")
+    audit_tolerance_kwh: float
+    num_periods: int
+    current_revision: int = Field(
+        description="当前修订号：0 表示尚无更正（修订记录即最初上报记录）"
+    )
+    original_records: List[ConfirmedRecord] = Field(
+        description="最初上报的原始记录（更正不改写，与原会话查询一致）"
+    )
+    revised_records: List[RevisedRecord] = Field(
+        description="当前修订后的完整实测台账（无更正时与原始记录一致）"
+    )
+    changed_indices: List[int] = Field(
+        description="当前修订与原始记录不一致的时段下标（升序）"
+    )
+    revised_audit: List[BatchAuditRecord] = Field(
+        description="对当前修订整段台账重算的遥测审计（全局下标）"
+    )
+    revisions: List[CorrectionRevisionSummary] = Field(
+        description="已生效更正的历史概览（修订号升序）"
+    )
+    settlement_request: SettlementRequest = Field(
+        description="可直接 POST 给 /dispatch/settlement 的完整请求数据："
+        "原 dispatch 输入、原计划快照、会话审计容差与当前修订记录"
+    )

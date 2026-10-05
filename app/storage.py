@@ -14,7 +14,11 @@
   成功时的值不随后续批次漂移；
 - 旧库只有 sessions / session_records 两张表时，session_batches 由
   CREATE TABLE IF NOT EXISTS 自动补齐（空表）：查询与从 next_index 续报
-  不受影响；已确认区间内没有批次边界可核对，不按前缀猜测去重。
+  不受影响；已确认区间内没有批次边界可核对，不按前缀猜测去重；
+- session_corrections 为已完成会话的计量表更正台账：按 (session_id, revision)
+  主键保存每次更正后的全量修订记录与本次替换条目，当前修订号取 MAX(revision)
+  （无行即第 0 版＝最初上报的原始记录）；更正只写本表，session_records /
+  session_batches 中的原始证据、批次边界与首收回执一律不改写。
 """
 
 from __future__ import annotations
@@ -26,7 +30,8 @@ from contextlib import contextmanager
 from typing import Iterator, List, Optional
 
 # 单条记录为半小时实测，计划最长 200 段，记录列只存 JSON，无需额外规模设计。
-# session_batches 为批次边界与首收回执表：后加的新表，旧库打开时由 IF NOT EXISTS 自动补建。
+# session_batches 为批次边界与首收回执表、session_corrections 为计量表更正台账：
+# 均为后加的新表，旧库打开时由 IF NOT EXISTS 自动补建（更正表为空即当前第 0 版）。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -51,6 +56,15 @@ CREATE TABLE IF NOT EXISTS session_batches (
     receipt_json TEXT NOT NULL,
     stored_at TEXT NOT NULL,
     PRIMARY KEY (session_id, start_index),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+CREATE TABLE IF NOT EXISTS session_corrections (
+    session_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    records_json TEXT NOT NULL,
+    entries_json TEXT NOT NULL,
+    stored_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, revision),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 """
@@ -219,6 +233,52 @@ class SessionStore:
             " VALUES (?, ?, ?, ?, ?)",
             (session_id, start_index, batch_size, receipt_json, stored_at),
         )
+
+    def get_current_revision(self, conn: sqlite3.Connection, session_id: str) -> int:
+        """会话当前修订号：无更正记录即第 0 版（最初上报的原始记录）。"""
+        row = conn.execute(
+            "SELECT MAX(revision) AS r FROM session_corrections WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return 0 if row["r"] is None else int(row["r"])
+
+    def get_correction(
+        self, conn: sqlite3.Connection, session_id: str, revision: int
+    ) -> Optional[sqlite3.Row]:
+        """取指定修订号的全量修订记录与替换条目；无该修订返回 None。"""
+        return conn.execute(
+            "SELECT revision, records_json, entries_json, stored_at "
+            "FROM session_corrections WHERE session_id = ? AND revision = ?",
+            (session_id, revision),
+        ).fetchone()
+
+    def insert_correction(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        revision: int,
+        records_json: str,
+        entries_json: str,
+        stored_at: str,
+    ) -> None:
+        """与修订号判定同一事务写入新修订（原子保存修订号与修订记录）。"""
+        conn.execute(
+            "INSERT INTO session_corrections"
+            "(session_id, revision, records_json, entries_json, stored_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (session_id, revision, records_json, entries_json, stored_at),
+        )
+
+    def list_corrections(self, session_id: str) -> List[sqlite3.Row]:
+        """按修订号升序取会话全部更正（末行即当前修订）。"""
+        with self._lock, self._connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT revision, records_json, entries_json, stored_at "
+                    "FROM session_corrections WHERE session_id = ? ORDER BY revision",
+                    (session_id,),
+                ).fetchall()
+            )
 
 
 _store: Optional[SessionStore] = None
